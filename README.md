@@ -32,8 +32,26 @@ jobs:
       prompt_path: .github/prompts/routine-a.md
       model: claude-sonnet-5
       job_display_name: "weekly synthesis"
-    secrets: inherit
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
+      ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      DRY_RUN: ${{ secrets.DRY_RUN }}
 ```
+
+**Use explicit per-secret passthrough, not `secrets: inherit`.** Confirmed
+empirically (2026-08-09, `organize-squad-kb` pilot): `secrets: inherit` from
+a caller in one GitHub account (`toniaquino`) to this repo's workflow in a
+different account (`toni-aq`) resulted in the called job failing before a
+runner was even allocated (no logs, ~3-6s failure) -- almost certainly a
+required-secrets validation failure, i.e. `inherit` did not reliably carry
+the secrets across the account boundary. Switching to explicit per-secret
+assignment (as above) fixed it on the first try. `secrets: inherit` may
+well work fine for same-owner cross-repo calls; it just isn't proven here
+and isn't worth re-testing when the explicit form is equally short and
+known-good.
 
 See the workflow file's own header comments for the full input/secret list
 and for what it deliberately does NOT support (routine-specific one-off
