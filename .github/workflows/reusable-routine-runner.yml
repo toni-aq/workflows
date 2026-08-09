@@ -48,11 +48,6 @@ on:
         type: string
         default: "routine"
         description: "Used only in log echo lines for readability"
-      dry_run_override:
-        required: false
-        type: string
-        default: ""
-        description: "If non-empty, overrides secrets.DRY_RUN. Intended for manual workflow_dispatch test runs only -- callers should leave this empty on scheduled (cron) triggers so live behavior is unaffected."
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -72,7 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      DRY_RUN: ${{ inputs.dry_run_override != '' && inputs.dry_run_override || (secrets.DRY_RUN || 'false') }}
+      DRY_RUN: ${{ secrets.DRY_RUN || 'false' }}
     steps:
       - name: Cache npm global packages
         uses: actions/cache@v3
