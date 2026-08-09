@@ -1,0 +1,117 @@
+name: Reusable Claude Code routine runner
+
+# Shared by every squad-kb and Team Vault routine (Routine A/A2/B in the
+# squad repos, Routine 6/6B/7/7B/8B/9 in the Team Vault). Hosted in this
+# PUBLIC repo specifically -- an earlier attempt hosted it in
+# toniaquino/content-variations-delivery-performance-kb (private) and
+# referenced it cross-repo from toniaquino/organize-squad-kb (also
+# private). A live workflow_dispatch test failed with
+# "422 workflow was not found", confirming empirically that GitHub does
+# NOT support cross-repo workflow_call access to a private repo under a
+# personal (non-org) GitHub account. Public repos have no such
+# restriction. Do not move this back to a private repo without a real
+# reason to re-test that -- it's a confirmed finding, not a guess.
+#
+# Same-repo references (uses: ./.github/workflows/x.yml) are NOT subject
+# to this restriction -- only cross-repo ones are.
+#
+# NOTE: Routine 8 (Confluence seed, in content-variations-delivery-
+# performance-kb) does NOT call this -- it needs 5 extra secrets
+# (CONFLUENCE_SPACE_KEY, TONY_GITHUB_USERNAME, BAS_GITHUB_USERNAME,
+# TONY_SLACK_ID, BAS_SLACK_ID) this runner doesn't declare. Don't add
+# routine-specific secrets here just to fit Routine 8 in -- that defeats
+# the point of a generic shared runner. If a second routine needs the
+# same kind of one-off secret, reconsider then, not before.
+#
+# This repo intentionally contains no proprietary content -- just this
+# generic CI orchestration file, public only because GitHub requires that
+# for cross-repo workflow_call reuse under a personal account.
+
+on:
+  workflow_call:
+    inputs:
+      repo_name:
+        required: true
+        type: string
+        description: "Repo to clone, under github.com/toniaquino/"
+      prompt_path:
+        required: true
+        type: string
+        description: "Path to the routine prompt file inside the cloned repo"
+      model:
+        required: false
+        type: string
+        default: ""
+        description: "Optional --model flag value; omit to use Claude Code's default model"
+      job_display_name:
+        required: false
+        type: string
+        default: "routine"
+        description: "Used only in log echo lines for readability"
+      dry_run_override:
+        required: false
+        type: string
+        default: ""
+        description: "If non-empty, overrides secrets.DRY_RUN. Intended for manual workflow_dispatch test runs only -- callers should leave this empty on scheduled (cron) triggers so live behavior is unaffected."
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      GH_PAT:
+        required: true
+      ATLASSIAN_API_TOKEN:
+        required: false
+      ATLASSIAN_EMAIL:
+        required: false
+      SLACK_BOT_TOKEN:
+        required: false
+      DRY_RUN:
+        required: false
+
+jobs:
+  run-routine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DRY_RUN: ${{ inputs.dry_run_override != '' && inputs.dry_run_override || (secrets.DRY_RUN || 'false') }}
+    steps:
+      - name: Cache npm global packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm-global
+          key: ${{ runner.os }}-npm-claude-code-v1
+          restore-keys: |
+            ${{ runner.os }}-npm-claude-code-
+
+      - name: Install Claude Code (with cache)
+        run: |
+          npm config set prefix ~/.npm-global
+          export PATH=~/.npm-global/bin:$PATH
+          if command -v claude >/dev/null 2>&1; then
+            echo "Claude Code already present via cache hit -- skipping npm install"
+          else
+            npm install -g @anthropic-ai/claude-code
+          fi
+          echo "PATH=~/.npm-global/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Run ${{ inputs.job_display_name }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
+          ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          DRY_RUN: ${{ env.DRY_RUN }}
+          REPO_NAME: ${{ inputs.repo_name }}
+          PROMPT_PATH: ${{ inputs.prompt_path }}
+          MODEL: ${{ inputs.model }}
+        run: |
+          git clone --depth 1 "https://toniaquino:$GH_PAT@github.com/toniaquino/$REPO_NAME.git" "/tmp/$REPO_NAME"
+          MODEL_FLAG=()
+          if [ -n "$MODEL" ]; then
+            MODEL_FLAG=(--model "$MODEL")
+          fi
+          claude --dangerously-skip-permissions "${MODEL_FLAG[@]}" -p "$(cat "/tmp/$REPO_NAME/$PROMPT_PATH")" --output-format json > /tmp/claude-output.json
+          echo "----- Routine output -----"
+          jq -r '.result // "(no .result field -- see raw JSON below)"' /tmp/claude-output.json
+          echo "----- Cost and usage (verify field names against this first real run) -----"
+          jq '{cost_usd: .total_cost_usd, duration_ms: .duration_ms, num_turns: .num_turns, usage: .usage}' /tmp/claude-output.json 2>/dev/null || cat /tmp/claude-output.json
