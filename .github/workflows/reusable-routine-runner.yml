@@ -100,7 +100,17 @@ jobs:
           PROMPT_PATH: ${{ inputs.prompt_path }}
           MODEL: ${{ inputs.model }}
         run: |
-          git clone --depth 1 "https://toniaquino:$GH_PAT@github.com/toniaquino/$REPO_NAME.git" "/tmp/$REPO_NAME"
+          # Auth via a git http.extraheader instead of embedding $GH_PAT in the
+          # remote URL. A credential-in-URL survives in plaintext in `origin`'s
+          # URL for the life of the clone, so any later `git remote -v` (the
+          # routine runs this while diagnosing push failures) echoes it straight
+          # into this job's transcript -- confirmed happening on multiple runs.
+          # The header is written to local git config instead, which git sends
+          # automatically on every request to github.com without it ever
+          # appearing in `git remote -v` output.
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_PAT" | base64 -w 0)"
+          git -c http.extraheader="$AUTH_HEADER" clone --depth 1 "https://github.com/toniaquino/$REPO_NAME.git" "/tmp/$REPO_NAME"
+          git -C "/tmp/$REPO_NAME" config http.https://github.com/.extraheader "$AUTH_HEADER"
           MODEL_FLAG=()
           if [ -n "$MODEL" ]; then
             MODEL_FLAG=(--model "$MODEL")
