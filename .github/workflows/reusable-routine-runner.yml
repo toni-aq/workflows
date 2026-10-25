@@ -48,6 +48,11 @@ on:
         type: string
         default: "routine"
         description: "Used only in log echo lines for readability"
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+        description: "Per-run dry run. When true, DRY_RUN=true is passed to the routine regardless of the DRY_RUN secret"
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -67,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      DRY_RUN: ${{ secrets.DRY_RUN || 'false' }}
+      DRY_RUN: ${{ (inputs.dry_run && 'true') || secrets.DRY_RUN || 'false' }}
     steps:
       - name: Cache npm global packages
         uses: actions/cache@v3
