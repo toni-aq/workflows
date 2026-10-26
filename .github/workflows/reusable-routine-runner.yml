@@ -48,6 +48,11 @@ on:
         type: string
         default: "routine"
         description: "Used only in log echo lines for readability"
+      pre_script:
+        required: false
+        type: string
+        default: ""
+        description: "Optional path (inside the cloned repo) of a bash script to run before Claude, with the same env and secrets. Use it to fetch and compress data outside the model. Its failure does not fail the job; the prompt is expected to fall back."
       dry_run:
         required: false
         type: boolean
@@ -104,6 +109,7 @@ jobs:
           REPO_NAME: ${{ inputs.repo_name }}
           PROMPT_PATH: ${{ inputs.prompt_path }}
           MODEL: ${{ inputs.model }}
+          PRE_SCRIPT: ${{ inputs.pre_script }}
         run: |
           # Auth via a git http.extraheader instead of embedding $GH_PAT in the
           # remote URL. A credential-in-URL survives in plaintext in `origin`'s
@@ -116,6 +122,10 @@ jobs:
           AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_PAT" | base64 -w 0)"
           git -c http.extraheader="$AUTH_HEADER" clone --depth 1 "https://github.com/toniaquino/$REPO_NAME.git" "/tmp/$REPO_NAME"
           git -C "/tmp/$REPO_NAME" config http.https://github.com/.extraheader "$AUTH_HEADER"
+          if [ -n "$PRE_SCRIPT" ]; then
+            echo "----- pre-script: $PRE_SCRIPT -----"
+            bash "/tmp/$REPO_NAME/$PRE_SCRIPT" || echo "pre-script exited non-zero; continuing (the prompt should fall back)"
+          fi
           MODEL_FLAG=()
           if [ -n "$MODEL" ]; then
             MODEL_FLAG=(--model "$MODEL")
