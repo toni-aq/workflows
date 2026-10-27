@@ -78,6 +78,16 @@ on:
         type: string
         default: "ops-state"
         description: "Branch of the cloned repo that receives one JSON line per run (costs.jsonl): cost, turns, tokens, outcome. Created if missing. Set to 'none' to turn the ledger off."
+      dedupe_hours:
+        required: false
+        type: string
+        default: ""
+        description: "Optional duplicate-run guard. A live (not dry) run is skipped, with no model call, if the ledger shows this workflow already finished a live run successfully in the last N hours. Empty or 0 turns it off. Needs the ledger branch."
+      force_run:
+        required: false
+        type: boolean
+        default: false
+        description: "Run even if the duplicate-run guard would skip it (pass the workflow_dispatch 'force' input here)."
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -131,6 +141,12 @@ jobs:
           MODEL: ${{ inputs.model }}
           PRE_SCRIPT: ${{ inputs.pre_script }}
           MAX_TURNS: ${{ inputs.max_turns }}
+          DEDUPE_HOURS: ${{ inputs.dedupe_hours }}
+          FORCE_RUN: ${{ inputs.force_run }}
+          LEDGER_BRANCH: ${{ inputs.ledger_branch }}
+          ALERT_SLACK_ID: ${{ inputs.alert_slack_id }}
+          WORKFLOW: ${{ github.workflow }}
+          JOB_NAME: ${{ inputs.job_display_name }}
         run: |
           # Auth via a git http.extraheader instead of embedding $GH_PAT in the
           # remote URL. A credential-in-URL survives in plaintext in `origin`'s
@@ -143,6 +159,27 @@ jobs:
           AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_PAT" | base64 -w 0)"
           git -c http.extraheader="$AUTH_HEADER" clone --depth 1 "https://github.com/toniaquino/$REPO_NAME.git" "/tmp/$REPO_NAME"
           git -C "/tmp/$REPO_NAME" config http.https://github.com/.extraheader "$AUTH_HEADER"
+          # Duplicate-run guard: a second live run of the same workflow within DEDUPE_HOURS is skipped before any model cost.
+          if [ -n "$DEDUPE_HOURS" ] && [ "$DEDUPE_HOURS" != "0" ] && [ "$FORCE_RUN" != "true" ] && [ "$DRY_RUN" = "false" ] \
+             && [ -n "$LEDGER_BRANCH" ] && [ "$LEDGER_BRANCH" != "none" ]; then
+            CUTOFF="$(date -u -d "$DEDUPE_HOURS hours ago" +%Y-%m-%dT%H:%M:%SZ)"
+            PRIOR=""
+            if git -C "/tmp/$REPO_NAME" fetch -q --depth 1 origin "$LEDGER_BRANCH" 2>/dev/null; then
+              PRIOR="$(git -C "/tmp/$REPO_NAME" show FETCH_HEAD:costs.jsonl 2>/dev/null \
+                | jq -rs --arg wf "$WORKFLOW" --arg cutoff "$CUTOFF" \
+                  '[.[] | select(.workflow == $wf and .dry_run == false and .exit == 0 and (.ts >= $cutoff))] | last | if . then "\(.ts) run \(.run_id)" else empty end' 2>/dev/null)" || PRIOR=""
+            fi
+            if [ -n "$PRIOR" ]; then
+              echo "SKIPPED (duplicate-run guard): $JOB_NAME already finished a live run in the last $DEDUPE_HOURS hours ($PRIOR). No model call was made. Re-run with force ticked to override."
+              echo "0" > /tmp/claude-exit
+              if [ -n "$ALERT_SLACK_ID" ] && [ -n "$SLACK_BOT_TOKEN" ]; then
+                curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" --data-urlencode "channel=$ALERT_SLACK_ID" \
+                  --data-urlencode "text=Skipped duplicate run: $JOB_NAME already ran live ($PRIOR) in the last $DEDUPE_HOURS hours. Re-run with force ticked to override." \
+                  https://slack.com/api/chat.postMessage | jq -r 'if .ok then "Skip notice sent." else "Skip notice failed: \(.error)" end'
+              fi
+              exit 0
+            fi
+          fi
           if [ -n "$PRE_SCRIPT" ]; then
             echo "----- pre-script: $PRE_SCRIPT -----"
             bash "/tmp/$REPO_NAME/$PRE_SCRIPT" || echo "pre-script exited non-zero; continuing (the prompt should fall back)"
@@ -198,17 +235,22 @@ jobs:
           else
             CLAUDE_EXIT="$(cat /tmp/claude-exit 2>/dev/null || echo 0)"
             OUTCOME='{}'
+            # What the output tokens were spent on (cost plan item 6, step 0), read from claude's session transcript.
+            # The script is scripts/out_breakdown.py in this repo, embedded as base64 (regenerate: base64 -w0 scripts/out_breakdown.py).
+            echo "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiJTdW1tYXJpemUgd2hhdCBhIENsYXVkZSBDb2RlIHJ1bidzIG91dHB1dCB0b2tlbnMgd2VyZSBzcGVudCBvbiwgZnJvbSBpdHMgc2Vzc2lvbiB0cmFuc2NyaXB0LgoKVXNhZ2U6IG91dF9icmVha2Rvd24ucHkgW3RyYW5zY3JpcHQuanNvbmxdICAgKGRlZmF1bHQ6IG5ld2VzdCAqLmpzb25sIHVuZGVyIH4vLmNsYXVkZS9wcm9qZWN0cykKUHJpbnRzIG9uZSBjb21wYWN0IEpTT04gb2JqZWN0LiBOZXZlciByYWlzZXM6IG9uIGFueSBwcm9ibGVtIHByaW50cyB7ImVycm9yIjogIi4uLiJ9LgoKRmllbGRzOiBtZXNzYWdlcyAoZGlzdGluY3QgYXNzaXN0YW50IG1lc3NhZ2VzKSwgb3V0cHV0X3Rva2VucyAoc3VtIG9mIHBlci1tZXNzYWdlIHVzYWdlKSwgdGhpbmtpbmdfdG9rZW5zIChzdW0gb2YKb3V0cHV0X3Rva2Vuc19kZXRhaWxzLnRoaW5raW5nX3Rva2VucyB3aGVuIHRoZSBDTEkgcmVwb3J0cyBpdCwgZWxzZSBudWxsKSwgdGV4dF9jaGFycyAodmlzaWJsZSBhc3Npc3RhbnQgdGV4dCksCnRvb2xfaW5wdXRfY2hhcnMgYnkgZ3JvdXAgKGVkaXQgPSBFZGl0L1dyaXRlL011bHRpRWRpdC9Ob3RlYm9va0VkaXQgcGF5bG9hZHMsIGJhc2gsIG90aGVyKSwgdG9vbF9jYWxscyBieSB0b29sIG5hbWUsCmxhcmdlc3RfbWVzc2FnZV90b2tlbnMsIGFuZCB0aGUgZml2ZSBsYXJnZXN0IHRvb2wgaW5wdXRzICh0b29sLCBjaGFycykuCiIiIgppbXBvcnQgZ2xvYiwganNvbiwgb3MsIHN5cwoKZGVmIG1haW4oKToKICAgIHBhdGggPSBzeXMuYXJndlsxXSBpZiBsZW4oc3lzLmFyZ3YpID4gMSBlbHNlIE5vbmUKICAgIGlmIG5vdCBwYXRoOgogICAgICAgIGZpbGVzID0gZ2xvYi5nbG9iKG9zLnBhdGguZXhwYW5kdXNlcigifi8uY2xhdWRlL3Byb2plY3RzLyovKi5qc29ubCIpKQogICAgICAgIGlmIG5vdCBmaWxlczoKICAgICAgICAgICAgcmV0dXJuIHsiZXJyb3IiOiAibm8gdHJhbnNjcmlwdCBmb3VuZCJ9CiAgICAgICAgcGF0aCA9IG1heChmaWxlcywga2V5PW9zLnBhdGguZ2V0bXRpbWUpCiAgICBsYXN0X3VzYWdlLCB0ZXh0X2NoYXJzLCBjYWxscywgZ3JvdXBzLCBiaWdnZXN0ID0ge30sIDAsIHt9LCB7ImVkaXQiOiAwLCAiYmFzaCI6IDAsICJvdGhlciI6IDB9LCBbXQogICAgc2Vlbl9ibG9ja3MgPSBzZXQoKQogICAgd2l0aCBvcGVuKHBhdGgpIGFzIGZoOgogICAgICAgIGZvciBsaW5lIGluIGZoOgogICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICBvID0ganNvbi5sb2FkcyhsaW5lKQogICAgICAgICAgICBleGNlcHQgVmFsdWVFcnJvcjoKICAgICAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgICAgIGlmIG8uZ2V0KCJ0eXBlIikgIT0gImFzc2lzdGFudCI6CiAgICAgICAgICAgICAgICBjb250aW51ZQogICAgICAgICAgICBtc2cgPSBvLmdldCgibWVzc2FnZSIpIG9yIHt9CiAgICAgICAgICAgIG1pZCA9IG1zZy5nZXQoImlkIikgb3Igby5nZXQoInV1aWQiKQogICAgICAgICAgICBpZiBpc2luc3RhbmNlKG1zZy5nZXQoInVzYWdlIiksIGRpY3QpOgogICAgICAgICAgICAgICAgbGFzdF91c2FnZVttaWRdID0gbXNnWyJ1c2FnZSJdICAgICAgICAgICMgb25lIGFzc2lzdGFudCBtZXNzYWdlIGNhbiBiZSB3cml0dGVuIGFzIHNldmVyYWwgbGluZXM7IGtlZXAgdGhlIGxhc3QKICAgICAgICAgICAgY29udGVudCA9IG1zZy5nZXQoImNvbnRlbnQiKQogICAgICAgICAgICBmb3IgYiBpbiBjb250ZW50IGlmIGlzaW5zdGFuY2UoY29udGVudCwgbGlzdCkgZWxzZSBbXToKICAgICAgICAgICAgICAgIGtleSA9IChtaWQsIGIuZ2V0KCJpZCIpIG9yIGIuZ2V0KCJ0eXBlIiksIGxlbihqc29uLmR1bXBzKGIsIGRlZmF1bHQ9c3RyKSkpCiAgICAgICAgICAgICAgICBpZiBrZXkgaW4gc2Vlbl9ibG9ja3M6CiAgICAgICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgICAgIHNlZW5fYmxvY2tzLmFkZChrZXkpCiAgICAgICAgICAgICAgICBpZiBiLmdldCgidHlwZSIpID09ICJ0ZXh0IjoKICAgICAgICAgICAgICAgICAgICB0ZXh0X2NoYXJzICs9IGxlbihiLmdldCgidGV4dCIsICIiKSkKICAgICAgICAgICAgICAgIGVsaWYgYi5nZXQoInR5cGUiKSA9PSAidG9vbF91c2UiOgogICAgICAgICAgICAgICAgICAgIG5hbWUgPSBiLmdldCgibmFtZSIsICI/IikKICAgICAgICAgICAgICAgICAgICBuID0gbGVuKGpzb24uZHVtcHMoYi5nZXQoImlucHV0Iiwge30pLCBkZWZhdWx0PXN0cikpCiAgICAgICAgICAgICAgICAgICAgY2FsbHNbbmFtZV0gPSBjYWxscy5nZXQobmFtZSwgMCkgKyAxCiAgICAgICAgICAgICAgICAgICAgZyA9ICJlZGl0IiBpZiBuYW1lIGluICgiRWRpdCIsICJXcml0ZSIsICJNdWx0aUVkaXQiLCAiTm90ZWJvb2tFZGl0IikgZWxzZSAiYmFzaCIgaWYgbmFtZSA9PSAiQmFzaCIgZWxzZSAib3RoZXIiCiAgICAgICAgICAgICAgICAgICAgZ3JvdXBzW2ddICs9IG4KICAgICAgICAgICAgICAgICAgICBiaWdnZXN0LmFwcGVuZCgobiwgbmFtZSkpCiAgICBvdXRfdG9rZW5zID0gc3VtKGludCh1LmdldCgib3V0cHV0X3Rva2VucyIpIG9yIDApIGZvciB1IGluIGxhc3RfdXNhZ2UudmFsdWVzKCkpCiAgICB0aGluayA9IFt1LmdldCgib3V0cHV0X3Rva2Vuc19kZXRhaWxzIiwge30pLmdldCgidGhpbmtpbmdfdG9rZW5zIikgZm9yIHUgaW4gbGFzdF91c2FnZS52YWx1ZXMoKSBpZiBpc2luc3RhbmNlKHUuZ2V0KCJvdXRwdXRfdG9rZW5zX2RldGFpbHMiKSwgZGljdCldCiAgICBiaWdnZXN0LnNvcnQocmV2ZXJzZT1UcnVlKQogICAgcmV0dXJuIHsibWVzc2FnZXMiOiBsZW4obGFzdF91c2FnZSksICJvdXRwdXRfdG9rZW5zIjogb3V0X3Rva2VucywKICAgICAgICAgICAgInRoaW5raW5nX3Rva2VucyI6IHN1bShpbnQodCBvciAwKSBmb3IgdCBpbiB0aGluaykgaWYgdGhpbmsgZWxzZSBOb25lLAogICAgICAgICAgICAidGV4dF9jaGFycyI6IHRleHRfY2hhcnMsICJ0b29sX2lucHV0X2NoYXJzIjogZ3JvdXBzLCAidG9vbF9jYWxscyI6IGNhbGxzLAogICAgICAgICAgICAibGFyZ2VzdF9tZXNzYWdlX3Rva2VucyI6IG1heCgoaW50KHUuZ2V0KCJvdXRwdXRfdG9rZW5zIikgb3IgMCkgZm9yIHUgaW4gbGFzdF91c2FnZS52YWx1ZXMoKSksIGRlZmF1bHQ9MCksCiAgICAgICAgICAgICJsYXJnZXN0X3Rvb2xfaW5wdXRzIjogW3sidG9vbCI6IHQsICJjaGFycyI6IG59IGZvciBuLCB0IGluIGJpZ2dlc3RbOjVdXX0KCmlmIF9fbmFtZV9fID09ICJfX21haW5fXyI6CiAgICB0cnk6CiAgICAgICAgcHJpbnQoanNvbi5kdW1wcyhtYWluKCksIHNlcGFyYXRvcnM9KCIsIiwgIjoiKSkpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgcHJpbnQoanNvbi5kdW1wcyh7ImVycm9yIjogdHlwZShlKS5fX25hbWVfX30pKQo=" | base64 -d > /tmp/out_breakdown.py
+            BREAKDOWN="$(python3 /tmp/out_breakdown.py 2>/dev/null)" || BREAKDOWN='{"error":"breakdown failed"}'
+            echo "$BREAKDOWN" | jq -e . >/dev/null 2>&1 || BREAKDOWN='{"error":"breakdown unreadable"}'
             if [ -n "$OUTCOME_FILE" ] && [ -s "$OUTCOME_FILE" ]; then
               OUTCOME="$(jq -c . "$OUTCOME_FILE" 2>/dev/null || echo '{}')"
             fi
             REC="$(jq -c --arg ts "$(date -u +%FT%TZ)" --arg wf "$WORKFLOW" --arg job "$JOB_NAME" --arg run "$RUN_ID" \
               --arg event "$EVENT" --arg model "$MODEL" --arg dry "$DRY_RUN" --arg cap "$MAX_TURNS" --arg exit "$CLAUDE_EXIT" \
-              --argjson outcome "$OUTCOME" \
+              --argjson outcome "$OUTCOME" --argjson breakdown "$BREAKDOWN" \
               '{ts: $ts, workflow: $wf, job: $job, run_id: $run, event: $event, model: $model, dry_run: ($dry != "false"),
                 max_turns: (($cap | tonumber? ) // 0), exit: ($exit | tonumber? // $exit), cost_usd: .total_cost_usd,
                 turns: .num_turns, duration_ms: .duration_ms, is_error: (.is_error // false), subtype: (.subtype // null),
                 input_tokens: .usage.input_tokens, cache_read: .usage.cache_read_input_tokens,
-                cache_creation: .usage.cache_creation_input_tokens, output_tokens: .usage.output_tokens, outcome: $outcome}' \
+                cache_creation: .usage.cache_creation_input_tokens, output_tokens: .usage.output_tokens, outcome: $outcome, out: $breakdown}' \
               /tmp/claude-output.json 2>/dev/null)" || REC=""
           fi
 
