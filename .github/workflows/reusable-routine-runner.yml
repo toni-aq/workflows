@@ -58,6 +58,26 @@ on:
         type: boolean
         default: false
         description: "Per-run dry run. When true, DRY_RUN=true is passed to the routine regardless of the DRY_RUN secret"
+      max_turns:
+        required: false
+        type: string
+        default: ""
+        description: "Optional cap on agent turns (claude --max-turns). Empty or 0 means no cap. A run that hits it fails and, if alert_slack_id is set, DMs that user. Set it to about twice the highest turn count the routine has used."
+      outcome_file:
+        required: false
+        type: string
+        default: ""
+        description: "Optional path (on the runner) of a small JSON file the routine writes about what it did. If present after the run it is stored in the cost record under 'outcome'."
+      alert_slack_id:
+        required: false
+        type: string
+        default: ""
+        description: "Optional Slack user ID to DM when a run errors or hits max_turns. Needs the SLACK_BOT_TOKEN secret."
+      ledger_branch:
+        required: false
+        type: string
+        default: "ops-state"
+        description: "Branch of the cloned repo that receives one JSON line per run (costs.jsonl): cost, turns, tokens, outcome. Created if missing. Set to 'none' to turn the ledger off."
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -110,6 +130,7 @@ jobs:
           PROMPT_PATH: ${{ inputs.prompt_path }}
           MODEL: ${{ inputs.model }}
           PRE_SCRIPT: ${{ inputs.pre_script }}
+          MAX_TURNS: ${{ inputs.max_turns }}
         run: |
           # Auth via a git http.extraheader instead of embedding $GH_PAT in the
           # remote URL. A credential-in-URL survives in plaintext in `origin`'s
@@ -130,8 +151,94 @@ jobs:
           if [ -n "$MODEL" ]; then
             MODEL_FLAG=(--model "$MODEL")
           fi
-          claude --dangerously-skip-permissions "${MODEL_FLAG[@]}" -p "$(cat "/tmp/$REPO_NAME/$PROMPT_PATH")" --output-format json > /tmp/claude-output.json
+          TURN_FLAG=()
+          if [ -n "$MAX_TURNS" ] && [ "$MAX_TURNS" != "0" ]; then
+            TURN_FLAG=(--max-turns "$MAX_TURNS")
+          fi
+          # A non-zero exit (for example the turn cap) must not skip the cost lines below or the ledger step, so capture it
+          # and exit with it at the end.
+          set +e
+          claude --dangerously-skip-permissions "${MODEL_FLAG[@]}" "${TURN_FLAG[@]}" -p "$(cat "/tmp/$REPO_NAME/$PROMPT_PATH")" --output-format json > /tmp/claude-output.json
+          CLAUDE_EXIT=$?
+          set -e
+          echo "$CLAUDE_EXIT" > /tmp/claude-exit
           echo "----- Routine output -----"
           jq -r '.result // "(no .result field -- see raw JSON below)"' /tmp/claude-output.json
           echo "----- Cost and usage (verify field names against this first real run) -----"
           jq '{cost_usd: .total_cost_usd, duration_ms: .duration_ms, num_turns: .num_turns, usage: .usage}' /tmp/claude-output.json 2>/dev/null || cat /tmp/claude-output.json
+          if [ "$CLAUDE_EXIT" != "0" ]; then
+            echo "claude exited with code $CLAUDE_EXIT (subtype: $(jq -r '.subtype // "unknown"' /tmp/claude-output.json 2>/dev/null))"
+            exit "$CLAUDE_EXIT"
+          fi
+
+      - name: Record cost and alert on failure
+        if: always()
+        continue-on-error: true   # bookkeeping must never fail the routine
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          REPO_NAME: ${{ inputs.repo_name }}
+          JOB_NAME: ${{ inputs.job_display_name }}
+          MODEL: ${{ inputs.model }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+          OUTCOME_FILE: ${{ inputs.outcome_file }}
+          ALERT_SLACK_ID: ${{ inputs.alert_slack_id }}
+          LEDGER_BRANCH: ${{ inputs.ledger_branch }}
+          DRY_RUN: ${{ env.DRY_RUN }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          WORKFLOW: ${{ github.workflow }}
+          SERVER: ${{ github.server_url }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          if [ ! -s /tmp/claude-output.json ]; then
+            echo "No claude output to record (the run stopped before claude finished)."
+            CLAUDE_EXIT="$(cat /tmp/claude-exit 2>/dev/null || echo 'no output')"
+            REC=""
+          else
+            CLAUDE_EXIT="$(cat /tmp/claude-exit 2>/dev/null || echo 0)"
+            OUTCOME='{}'
+            if [ -n "$OUTCOME_FILE" ] && [ -s "$OUTCOME_FILE" ]; then
+              OUTCOME="$(jq -c . "$OUTCOME_FILE" 2>/dev/null || echo '{}')"
+            fi
+            REC="$(jq -c --arg ts "$(date -u +%FT%TZ)" --arg wf "$WORKFLOW" --arg job "$JOB_NAME" --arg run "$RUN_ID" \
+              --arg event "$EVENT" --arg model "$MODEL" --arg dry "$DRY_RUN" --arg cap "$MAX_TURNS" --arg exit "$CLAUDE_EXIT" \
+              --argjson outcome "$OUTCOME" \
+              '{ts: $ts, workflow: $wf, job: $job, run_id: $run, event: $event, model: $model, dry_run: ($dry != "false"),
+                max_turns: (($cap | tonumber? ) // 0), exit: ($exit | tonumber? // $exit), cost_usd: .total_cost_usd,
+                turns: .num_turns, duration_ms: .duration_ms, is_error: (.is_error // false), subtype: (.subtype // null),
+                input_tokens: .usage.input_tokens, cache_read: .usage.cache_read_input_tokens,
+                cache_creation: .usage.cache_creation_input_tokens, output_tokens: .usage.output_tokens, outcome: $outcome}' \
+              /tmp/claude-output.json 2>/dev/null)" || REC=""
+          fi
+
+          if [ -n "$REC" ]; then
+            echo "$REC"
+            echo "$JOB_NAME: \$$(echo "$REC" | jq -r '.cost_usd // 0'), $(echo "$REC" | jq -r '.turns // 0') turns" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -n "$REC" ] && [ "$LEDGER_BRANCH" != "none" ] && [ -n "$LEDGER_BRANCH" ]; then
+            rm -rf /tmp/ledger && mkdir /tmp/ledger && cd /tmp/ledger && git init -q
+            git remote add origin "https://github.com/toniaquino/$REPO_NAME.git"
+            git config http.https://github.com/.extraheader "$(git -C "/tmp/$REPO_NAME" config http.https://github.com/.extraheader)"
+            for attempt in 1 2 3; do
+              if git fetch -q --depth 1 origin "$LEDGER_BRANCH" 2>/dev/null; then
+                git checkout -q -B "$LEDGER_BRANCH" FETCH_HEAD
+              else
+                git checkout -q --orphan "$LEDGER_BRANCH" 2>/dev/null || true
+              fi
+              echo "$REC" >> costs.jsonl
+              git add costs.jsonl
+              git -c user.name=team-kb-bot -c user.email=team-kb-bot@bynder.com commit -q -m "cost: $JOB_NAME $RUN_ID"
+              if git push -q origin "$LEDGER_BRANCH" 2>/dev/null; then echo "Ledger updated ($LEDGER_BRANCH)."; break; fi
+              echo "Ledger push attempt $attempt failed; retrying."; sleep $((attempt * 2))
+            done
+            cd /
+          fi
+
+          SUBTYPE=""
+          if [ -n "$REC" ]; then SUBTYPE="$(echo "$REC" | jq -r '.subtype // ""' 2>/dev/null)"; fi
+          if [ -n "$ALERT_SLACK_ID" ] && [ -n "$SLACK_BOT_TOKEN" ] && { [ "$CLAUDE_EXIT" != "0" ] || [ "${SUBTYPE#error}" != "$SUBTYPE" ]; }; then
+            TEXT="Routine alert: $JOB_NAME ended with $( [ -n "$SUBTYPE" ] && echo "$SUBTYPE" || echo "exit $CLAUDE_EXIT" )$( [ -n "$REC" ] && echo " after $(echo "$REC" | jq -r '.turns // "?"') turns, \$$(echo "$REC" | jq -r '.cost_usd // "?"')" || true ). Run: $SERVER/$THIS_REPO/actions/runs/$RUN_ID"
+            curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" --data-urlencode "channel=$ALERT_SLACK_ID" --data-urlencode "text=$TEXT" https://slack.com/api/chat.postMessage | jq -r 'if .ok then "Alert sent." else "Alert failed: \(.error)" end'
+          fi
