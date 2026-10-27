@@ -88,6 +88,16 @@ on:
         type: boolean
         default: false
         description: "Run even if the duplicate-run guard would skip it (pass the workflow_dispatch 'force' input here)."
+      max_budget_usd:
+        required: false
+        type: string
+        default: ""
+        description: "Optional hard cap in US dollars for this run (claude --max-budget-usd). Empty or 0 means no cap. A run that hits it ends with an error subtype, fails, and DMs alert_slack_id. A cost backstop next to max_turns, for a run that stays under the turn cap but is expensive per turn."
+      effort:
+        required: false
+        type: string
+        default: ""
+        description: "Optional reasoning effort for this run (claude --effort): low, medium, high, xhigh or max. Empty uses Claude Code's default. Recorded in the cost ledger so runs at different efforts can be compared."
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -142,6 +152,8 @@ jobs:
           PRE_SCRIPT: ${{ inputs.pre_script }}
           MAX_TURNS: ${{ inputs.max_turns }}
           DEDUPE_HOURS: ${{ inputs.dedupe_hours }}
+          MAX_BUDGET_USD: ${{ inputs.max_budget_usd }}
+          EFFORT: ${{ inputs.effort }}
           FORCE_RUN: ${{ inputs.force_run }}
           LEDGER_BRANCH: ${{ inputs.ledger_branch }}
           ALERT_SLACK_ID: ${{ inputs.alert_slack_id }}
@@ -192,10 +204,18 @@ jobs:
           if [ -n "$MAX_TURNS" ] && [ "$MAX_TURNS" != "0" ]; then
             TURN_FLAG=(--max-turns "$MAX_TURNS")
           fi
+          BUDGET_FLAG=()
+          if [ -n "$MAX_BUDGET_USD" ] && [ "$MAX_BUDGET_USD" != "0" ]; then
+            BUDGET_FLAG=(--max-budget-usd "$MAX_BUDGET_USD")
+          fi
+          EFFORT_FLAG=()
+          if [ -n "$EFFORT" ]; then
+            EFFORT_FLAG=(--effort "$EFFORT")
+          fi
           # A non-zero exit (for example the turn cap) must not skip the cost lines below or the ledger step, so capture it
           # and exit with it at the end.
           set +e
-          claude --dangerously-skip-permissions "${MODEL_FLAG[@]}" "${TURN_FLAG[@]}" -p "$(cat "/tmp/$REPO_NAME/$PROMPT_PATH")" --output-format json > /tmp/claude-output.json
+          claude --dangerously-skip-permissions "${MODEL_FLAG[@]}" "${TURN_FLAG[@]}" "${BUDGET_FLAG[@]}" "${EFFORT_FLAG[@]}" -p "$(cat "/tmp/$REPO_NAME/$PROMPT_PATH")" --output-format json > /tmp/claude-output.json
           CLAUDE_EXIT=$?
           set -e
           echo "$CLAUDE_EXIT" > /tmp/claude-exit
@@ -218,6 +238,8 @@ jobs:
           JOB_NAME: ${{ inputs.job_display_name }}
           MODEL: ${{ inputs.model }}
           MAX_TURNS: ${{ inputs.max_turns }}
+          MAX_BUDGET_USD: ${{ inputs.max_budget_usd }}
+          EFFORT: ${{ inputs.effort }}
           OUTCOME_FILE: ${{ inputs.outcome_file }}
           ALERT_SLACK_ID: ${{ inputs.alert_slack_id }}
           LEDGER_BRANCH: ${{ inputs.ledger_branch }}
@@ -244,10 +266,10 @@ jobs:
               OUTCOME="$(jq -c . "$OUTCOME_FILE" 2>/dev/null || echo '{}')"
             fi
             REC="$(jq -c --arg ts "$(date -u +%FT%TZ)" --arg wf "$WORKFLOW" --arg job "$JOB_NAME" --arg run "$RUN_ID" \
-              --arg event "$EVENT" --arg model "$MODEL" --arg dry "$DRY_RUN" --arg cap "$MAX_TURNS" --arg exit "$CLAUDE_EXIT" \
+              --arg event "$EVENT" --arg model "$MODEL" --arg dry "$DRY_RUN" --arg cap "$MAX_TURNS" --arg exit "$CLAUDE_EXIT" --arg budget "$MAX_BUDGET_USD" --arg effort "$EFFORT" \
               --argjson outcome "$OUTCOME" --argjson breakdown "$BREAKDOWN" \
               '{ts: $ts, workflow: $wf, job: $job, run_id: $run, event: $event, model: $model, dry_run: ($dry != "false"),
-                max_turns: (($cap | tonumber? ) // 0), exit: ($exit | tonumber? // $exit), cost_usd: .total_cost_usd,
+                max_turns: (($cap | tonumber? ) // 0), max_budget_usd: (($budget | tonumber? ) // 0), effort: (if $effort == "" then null else $effort end), exit: ($exit | tonumber? // $exit), cost_usd: .total_cost_usd,
                 turns: .num_turns, duration_ms: .duration_ms, is_error: (.is_error // false), subtype: (.subtype // null),
                 input_tokens: .usage.input_tokens, cache_read: .usage.cache_read_input_tokens,
                 cache_creation: .usage.cache_creation_input_tokens, output_tokens: .usage.output_tokens, outcome: $outcome, out: $breakdown}' \
