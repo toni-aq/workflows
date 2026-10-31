@@ -72,8 +72,8 @@ does the rest":
    a clean clone at the commit the model started from, then runs `post_script` from that clean clone (git, PR, Slack,
    digest) and records the cost.
 
-Scripts are in `scripts/` and are checked out at the exact commit the caller pinned, so pin callers to a commit SHA, not
-`@main`. Callers that do not set `isolate` run exactly as before. Residual risk: the model can still write any file it is
+Scripts are in `scripts/` and are checked out at `runner_ref`. Set `runner_ref` to the same commit SHA as the `uses:` line
+(GitHub does not expose the called workflow's SHA to expressions), and pin callers to a commit SHA, not `@main`. Callers that do not set `isolate` run exactly as before. Residual risk: the model can still write any file it is
 allowed to, so everything in the allowed paths is reviewed as a draft PR before it reaches `main`; and `ANTHROPIC_API_KEY`
 is in the model step, with no tool that can send it anywhere.
 

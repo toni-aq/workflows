@@ -108,6 +108,11 @@ on:
         type: boolean
         default: false
         description: "Isolated path. The model runs in its own job with no secrets except ANTHROPIC_API_KEY and only the file tools in 'tools' (no shell, no web). A second job on a fresh runner takes the files it changed as data, writes them into a clean clone, runs post_script and records the cost. Needs post_script and apply_allow. Default false keeps the original single-job behaviour."
+      runner_ref:
+        required: false
+        type: string
+        default: "main"
+        description: "Isolated path only: the commit (or branch) of THIS repo to take the helper scripts from. Set it to the same commit SHA as the 'uses:' line, so the scripts that run with the secrets are the ones that were pinned. GitHub does not expose the called workflow's SHA to expressions, so it has to be passed."
       tools:
         required: false
         type: string
@@ -365,7 +370,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           repository: toni-aq/workflows
-          ref: ${{ github.job_workflow_sha || 'main' }}
+          ref: ${{ inputs.runner_ref }}
           path: runner
           persist-credentials: false
 
@@ -454,7 +459,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           repository: toni-aq/workflows
-          ref: ${{ github.job_workflow_sha || 'main' }}
+          ref: ${{ inputs.runner_ref }}
           path: runner
           persist-credentials: false
 
