@@ -4,7 +4,7 @@
 # claude-output.json, claude-exit, breakdown.json. Bookkeeping must never fail the routine: the workflow marks this
 # step continue-on-error.
 #
-# Env: GH_PAT SLACK_BOT_TOKEN REPO_NAME JOB_NAME MODEL MAX_TURNS MAX_BUDGET_USD EFFORT OUTCOME_FILE ALERT_SLACK_ID LEDGER_BRANCH
+# Env: GH_PAT SLACK_BOT_TOKEN REPO_NAME JOB_NAME MODEL MAX_TURNS MAX_BUDGET_USD EFFORT OUTCOME_FILE ALERT_SLACK_ID ALERT_CHANNEL_ID LEDGER_BRANCH
 #      DRY_RUN RUN_ID EVENT WORKFLOW SERVER THIS_REPO MODEL_OUT GITHUB_STEP_SUMMARY   (GIT_BASE: tests only)
 set -u
 GIT_BASE="${GIT_BASE:-https://github.com/toniaquino}"
@@ -68,5 +68,8 @@ if [ -n "${ALERT_SLACK_ID:-}" ] && [ -n "${SLACK_BOT_TOKEN:-}" ] && { [ "$CLAUDE
   [ -n "$REC" ] && DETAIL=" after $(echo "$REC" | jq -r '.turns // "?"') turns, \$$(echo "$REC" | jq -r '.cost_usd // "?"')"
   TEXT="Routine alert: $JOB_NAME ended with $WHAT$DETAIL. Run: $SERVER/$THIS_REPO/actions/runs/$RUN_ID"
   curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" --data-urlencode "channel=$ALERT_SLACK_ID" --data-urlencode "text=$TEXT" https://slack.com/api/chat.postMessage | jq -r 'if .ok then "Alert sent." else "Alert failed: \(.error)" end'
+  if [ -n "${ALERT_CHANNEL_ID:-}" ]; then
+    curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" --data-urlencode "channel=$ALERT_CHANNEL_ID" --data-urlencode "text=$TEXT" https://slack.com/api/chat.postMessage | jq -r 'if .ok then "Channel alert sent." else "Channel alert failed: \(.error)" end'
+  fi
 fi
 exit 0

@@ -73,6 +73,11 @@ on:
         type: string
         default: ""
         description: "Optional Slack user ID to DM when a run errors or hits max_turns. Needs the SLACK_BOT_TOKEN secret."
+      alert_channel_id:
+        required: false
+        type: string
+        default: ""
+        description: "Optional Slack channel ID that also receives the failure alert (same text as the DM to alert_slack_id), so a failure is visible to more than one person. Needs the SLACK_BOT_TOKEN secret and the bot in the channel."
       ledger_branch:
         required: false
         type: string
@@ -273,6 +278,7 @@ jobs:
           EFFORT: ${{ inputs.effort }}
           OUTCOME_FILE: ${{ inputs.outcome_file }}
           ALERT_SLACK_ID: ${{ inputs.alert_slack_id }}
+          ALERT_CHANNEL_ID: ${{ inputs.alert_channel_id }}
           LEDGER_BRANCH: ${{ inputs.ledger_branch }}
           DRY_RUN: ${{ env.DRY_RUN }}
           RUN_ID: ${{ github.run_id }}
@@ -336,6 +342,9 @@ jobs:
           if [ -n "$ALERT_SLACK_ID" ] && [ -n "$SLACK_BOT_TOKEN" ] && { [ "$CLAUDE_EXIT" != "0" ] || [ "${SUBTYPE#error}" != "$SUBTYPE" ]; }; then
             TEXT="Routine alert: $JOB_NAME ended with $( [ -n "$SUBTYPE" ] && echo "$SUBTYPE" || echo "exit $CLAUDE_EXIT" )$( [ -n "$REC" ] && echo " after $(echo "$REC" | jq -r '.turns // "?"') turns, \$$(echo "$REC" | jq -r '.cost_usd // "?"')" || true ). Run: $SERVER/$THIS_REPO/actions/runs/$RUN_ID"
             curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" --data-urlencode "channel=$ALERT_SLACK_ID" --data-urlencode "text=$TEXT" https://slack.com/api/chat.postMessage | jq -r 'if .ok then "Alert sent." else "Alert failed: \(.error)" end'
+            if [ -n "$ALERT_CHANNEL_ID" ]; then
+              curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" --data-urlencode "channel=$ALERT_CHANNEL_ID" --data-urlencode "text=$TEXT" https://slack.com/api/chat.postMessage | jq -r 'if .ok then "Channel alert sent." else "Channel alert failed: \(.error)" end'
+            fi
           fi
 
   # ---------------------------------------------------------------------------------------------------------------
@@ -506,6 +515,7 @@ jobs:
           EFFORT: ${{ inputs.effort }}
           OUTCOME_FILE: ${{ inputs.outcome_file }}
           ALERT_SLACK_ID: ${{ inputs.alert_slack_id }}
+          ALERT_CHANNEL_ID: ${{ inputs.alert_channel_id }}
           LEDGER_BRANCH: ${{ inputs.ledger_branch }}
           FINISH_FAILED: ${{ steps.finish.outcome == 'failure' }}
           RUN_ID: ${{ github.run_id }}
