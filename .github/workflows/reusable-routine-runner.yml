@@ -98,6 +98,36 @@ on:
         type: string
         default: ""
         description: "Optional reasoning effort for this run (claude --effort): low, medium, high, xhigh or max. Empty uses Claude Code's default. Recorded in the cost ledger so runs at different efforts can be compared."
+      isolate:
+        required: false
+        type: boolean
+        default: false
+        description: "Isolated path. The model runs in its own job with no secrets except ANTHROPIC_API_KEY and only the file tools in 'tools' (no shell, no web). A second job on a fresh runner takes the files it changed as data, writes them into a clean clone, runs post_script and records the cost. Needs post_script and apply_allow. Default false keeps the original single-job behaviour."
+      tools:
+        required: false
+        type: string
+        default: "Read,Edit,Write,Glob,Grep"
+        description: "Isolated path only: the tools the model may use (claude --tools). Keep it to file tools; adding Bash or WebFetch undoes the isolation."
+      post_script:
+        required: false
+        type: string
+        default: ""
+        description: "Isolated path only: path inside the target repo of a bash script run by the finish job after the model's files are applied. It runs from a fresh clone of the repo's default branch, with the secrets. It does the git, PR, Slack and digest work."
+      post_args:
+        required: false
+        type: string
+        default: ""
+        description: "Isolated path only: arguments passed to post_script (for example the squad name)."
+      apply_allow:
+        required: false
+        type: string
+        default: ""
+        description: "Isolated path only: regular expression the repo-relative path of every file the model changed must match, for example ^(01 Initiatives|02 Teams)/. Files that do not match are left behind and listed in the job log."
+      out_dir:
+        required: false
+        type: string
+        default: "/tmp/squad-out"
+        description: "Isolated path only: folder where the model writes results.json (created before the model runs, and the file is carried to the finish job)."
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -114,6 +144,7 @@ on:
 
 jobs:
   run-routine:
+    if: ${{ !inputs.isolate }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -306,3 +337,181 @@ jobs:
             TEXT="Routine alert: $JOB_NAME ended with $( [ -n "$SUBTYPE" ] && echo "$SUBTYPE" || echo "exit $CLAUDE_EXIT" )$( [ -n "$REC" ] && echo " after $(echo "$REC" | jq -r '.turns // "?"') turns, \$$(echo "$REC" | jq -r '.cost_usd // "?"')" || true ). Run: $SERVER/$THIS_REPO/actions/runs/$RUN_ID"
             curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" --data-urlencode "channel=$ALERT_SLACK_ID" --data-urlencode "text=$TEXT" https://slack.com/api/chat.postMessage | jq -r 'if .ok then "Alert sent." else "Alert failed: \(.error)" end'
           fi
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Isolated path (isolate: true). Job 'model' prepares and runs the model with nothing worth stealing; job 'finish'
+  # runs on a fresh runner, treats the model's files as untrusted data and does everything that needs a secret.
+  # ---------------------------------------------------------------------------------------------------------------
+  model:
+    if: ${{ inputs.isolate }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      skip: ${{ steps.prepare.outputs.skip }}
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
+    env:
+      DRY_RUN: ${{ (inputs.dry_run && 'true') || secrets.DRY_RUN || 'false' }}
+    steps:
+      - name: Checkout runner scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: toni-aq/workflows
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: runner
+          persist-credentials: false
+
+      # Restore only. Saving the cache here would let the model, which can write files, plant code in ~/.npm-global
+      # that later runs would restore. The single-job path still saves it.
+      - name: Restore the npm cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ~/.npm-global
+          key: ${{ runner.os }}-npm-claude-code-v1
+          restore-keys: |
+            ${{ runner.os }}-npm-claude-code-
+
+      - name: Install Claude Code (with cache)
+        run: |
+          npm config set prefix ~/.npm-global
+          export PATH=~/.npm-global/bin:$PATH
+          if command -v claude >/dev/null 2>&1; then
+            echo "Claude Code already present via cache hit -- skipping npm install"
+          else
+            npm install -g @anthropic-ai/claude-code
+          fi
+          echo "PATH=~/.npm-global/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Prepare (clone, duplicate-run guard, pre-fetch)
+        id: prepare
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
+          ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          REPO_NAME: ${{ inputs.repo_name }}
+          PRE_SCRIPT: ${{ inputs.pre_script }}
+          DEDUPE_HOURS: ${{ inputs.dedupe_hours }}
+          FORCE_RUN: ${{ inputs.force_run }}
+          LEDGER_BRANCH: ${{ inputs.ledger_branch }}
+          ALERT_SLACK_ID: ${{ inputs.alert_slack_id }}
+          WORKFLOW: ${{ github.workflow }}
+          JOB_NAME: ${{ inputs.job_display_name }}
+          OUT_DIR: ${{ inputs.out_dir }}
+        run: bash runner/scripts/prepare.sh
+
+      - name: Run ${{ inputs.job_display_name }} (no secrets, file tools only)
+        if: ${{ steps.prepare.outputs.skip != 'true' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REPO_NAME: ${{ inputs.repo_name }}
+          PROMPT_PATH: ${{ inputs.prompt_path }}
+          TOOLS: ${{ inputs.tools }}
+          MODEL: ${{ inputs.model }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+          MAX_BUDGET_USD: ${{ inputs.max_budget_usd }}
+          EFFORT: ${{ inputs.effort }}
+        run: bash runner/scripts/run_model.sh
+
+      - name: Pack the model's output
+        if: ${{ always() && steps.prepare.outputs.skip != 'true' }}
+        env:
+          REPO_NAME: ${{ inputs.repo_name }}
+          OUT_DIR: ${{ inputs.out_dir }}
+          ALLOW: ${{ inputs.apply_allow }}
+        run: |
+          mkdir -p /tmp/model-out
+          python3 -I runner/scripts/collect_output.py --repo "/tmp/$REPO_NAME" --out-dir "$OUT_DIR" --allow "$ALLOW" --dest /tmp/model-out
+          cp /tmp/claude-output.json /tmp/claude-exit /tmp/model-out/ 2>/dev/null || true
+          python3 -I runner/scripts/out_breakdown.py > /tmp/model-out/breakdown.json 2>/dev/null || echo '{"error":"breakdown failed"}' > /tmp/model-out/breakdown.json
+
+      - name: Upload the model's output
+        if: ${{ always() && steps.prepare.outputs.skip != 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: model-output
+          path: /tmp/model-out
+          retention-days: 7
+          if-no-files-found: ignore
+
+  finish:
+    needs: model
+    if: ${{ always() && inputs.isolate && needs.model.outputs.skip != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DRY_RUN: ${{ (inputs.dry_run && 'true') || secrets.DRY_RUN || 'false' }}
+    steps:
+      - name: Checkout runner scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: toni-aq/workflows
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: runner
+          persist-credentials: false
+
+      - name: Download the model's output
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: model-output
+          path: /tmp/model-out
+
+      - name: Apply the model's files and finish
+        id: finish
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
+          ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          REPO_NAME: ${{ inputs.repo_name }}
+          BASE_SHA: ${{ needs.model.outputs.base_sha }}
+          APPLY_ALLOW: ${{ inputs.apply_allow }}
+          OUT_DIR: ${{ inputs.out_dir }}
+          POST_SCRIPT: ${{ inputs.post_script }}
+          POST_ARGS: ${{ inputs.post_args }}
+          OUTCOME_FILE: ${{ inputs.outcome_file }}
+        run: |
+          if [ "$(cat /tmp/model-out/claude-exit 2>/dev/null || echo missing)" != "0" ]; then
+            echo "The model step did not finish cleanly (exit: $(cat /tmp/model-out/claude-exit 2>/dev/null || echo missing)); nothing to apply."
+            exit 0
+          fi
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_PAT" | base64 -w 0)"
+          git -c http.extraheader="$AUTH_HEADER" clone --depth 1 "https://github.com/toniaquino/$REPO_NAME.git" "/tmp/$REPO_NAME"
+          git -C "/tmp/$REPO_NAME" config http.https://github.com/.extraheader "$AUTH_HEADER"
+          if [ -n "$BASE_SHA" ]; then   # the commit the model started from, so its files are applied on the same base
+            git -C "/tmp/$REPO_NAME" fetch -q --depth 1 origin "$BASE_SHA"
+            git -C "/tmp/$REPO_NAME" checkout -q -B main FETCH_HEAD
+          fi
+          echo "----- Model files left behind (outside the allowed paths, deleted, or not plain files) -----"
+          cat /tmp/model-out/dropped.txt 2>/dev/null || echo "(none)"
+          python3 -I runner/scripts/apply_output.py --tar /tmp/model-out/model-output.tar --repo "/tmp/$REPO_NAME" \
+            --allow "$APPLY_ALLOW" --out-dir "$OUT_DIR"
+          if [ -n "$POST_SCRIPT" ]; then
+            echo "----- post-script: $POST_SCRIPT $POST_ARGS -----"
+            # shellcheck disable=SC2086
+            bash "/tmp/$REPO_NAME/$POST_SCRIPT" $POST_ARGS
+          fi
+
+      - name: Record cost and alert on failure
+        if: ${{ always() }}
+        continue-on-error: true   # bookkeeping must never fail the routine
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          REPO_NAME: ${{ inputs.repo_name }}
+          JOB_NAME: ${{ inputs.job_display_name }}
+          MODEL: ${{ inputs.model }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+          MAX_BUDGET_USD: ${{ inputs.max_budget_usd }}
+          EFFORT: ${{ inputs.effort }}
+          OUTCOME_FILE: ${{ inputs.outcome_file }}
+          ALERT_SLACK_ID: ${{ inputs.alert_slack_id }}
+          LEDGER_BRANCH: ${{ inputs.ledger_branch }}
+          FINISH_FAILED: ${{ steps.finish.outcome == 'failure' }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          WORKFLOW: ${{ github.workflow }}
+          SERVER: ${{ github.server_url }}
+          THIS_REPO: ${{ github.repository }}
+          MODEL_OUT: /tmp/model-out
+        run: bash runner/scripts/record.sh

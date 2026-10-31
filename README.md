@@ -56,3 +56,24 @@ known-good.
 See the workflow file's own header comments for the full input/secret list
 and for what it deliberately does NOT support (routine-specific one-off
 secrets — see the Routine 8 note).
+
+## Isolated mode (`isolate: true`)
+
+The single-job path runs the model with a shell and every secret in its environment, over text anyone at the company
+can post in Slack or Jira. Isolated mode removes that exposure for routines that can work as "edit files, then a script
+does the rest":
+
+1. **`model` job.** Clones the target repo, runs the duplicate-run guard and the pre-fetch script (the only step with
+   secrets), then removes the git credential from the clone. The model runs in a separate step with only
+   `ANTHROPIC_API_KEY` and only the tools in `tools` (default `Read,Edit,Write,Glob,Grep`: no shell, no web). Its
+   changed files and `results.json` are packed into one tar and uploaded.
+2. **`finish` job**, on a fresh runner. Treats the tar as untrusted data: regular files only, nothing outside
+   `apply_allow`, no `.git`, no links, size and count limits, and any violation stops everything. It writes the files into
+   a clean clone at the commit the model started from, then runs `post_script` from that clean clone (git, PR, Slack,
+   digest) and records the cost.
+
+Scripts are in `scripts/` and are checked out at the exact commit the caller pinned, so pin callers to a commit SHA, not
+`@main`. Callers that do not set `isolate` run exactly as before. Residual risk: the model can still write any file it is
+allowed to, so everything in the allowed paths is reviewed as a draft PR before it reaches `main`; and `ANTHROPIC_API_KEY`
+is in the model step, with no tool that can send it anywhere.
+
