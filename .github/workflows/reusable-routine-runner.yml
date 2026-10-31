@@ -113,6 +113,11 @@ on:
         type: string
         default: "main"
         description: "Isolated path only: the commit (or branch) of THIS repo to take the helper scripts from. Set it to the same commit SHA as the 'uses:' line, so the scripts that run with the secrets are the ones that were pinned. GitHub does not expose the called workflow's SHA to expressions, so it has to be passed."
+      repo_ref:
+        required: false
+        type: string
+        default: ""
+        description: "Isolated path only, for testing: branch of the target repo to clone instead of its default branch (for example to try a prompt before it is merged). Leave empty for real runs."
       tools:
         required: false
         type: string
@@ -411,6 +416,7 @@ jobs:
           WORKFLOW: ${{ github.workflow }}
           JOB_NAME: ${{ inputs.job_display_name }}
           OUT_DIR: ${{ inputs.out_dir }}
+          REPO_REF: ${{ inputs.repo_ref }}
         run: bash runner/scripts/prepare.sh
 
       - name: Run ${{ inputs.job_display_name }} (no secrets, file tools only)
@@ -484,13 +490,14 @@ jobs:
           POST_SCRIPT: ${{ inputs.post_script }}
           POST_ARGS: ${{ inputs.post_args }}
           OUTCOME_FILE: ${{ inputs.outcome_file }}
+          REPO_REF: ${{ inputs.repo_ref }}
         run: |
           if [ "$(cat /tmp/model-out/claude-exit 2>/dev/null || echo missing)" != "0" ]; then
             echo "The model step did not finish cleanly (exit: $(cat /tmp/model-out/claude-exit 2>/dev/null || echo missing)); nothing to apply."
             exit 0
           fi
           AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_PAT" | base64 -w 0)"
-          git -c http.extraheader="$AUTH_HEADER" clone --depth 1 "https://github.com/toniaquino/$REPO_NAME.git" "/tmp/$REPO_NAME"
+          git -c http.extraheader="$AUTH_HEADER" clone --depth 1 ${REPO_REF:+--branch "$REPO_REF"} "https://github.com/toniaquino/$REPO_NAME.git" "/tmp/$REPO_NAME"
           git -C "/tmp/$REPO_NAME" config http.https://github.com/.extraheader "$AUTH_HEADER"
           if [ -n "$BASE_SHA" ]; then   # the commit the model started from, so its files are applied on the same base
             git -C "/tmp/$REPO_NAME" fetch -q --depth 1 origin "$BASE_SHA"

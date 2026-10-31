@@ -4,13 +4,14 @@
 # so the model step (which has no secrets either) cannot read it.
 #
 # Env: GH_PAT REPO_NAME PRE_SCRIPT DEDUPE_HOURS FORCE_RUN DRY_RUN LEDGER_BRANCH WORKFLOW JOB_NAME OUT_DIR
-#      ALERT_SLACK_ID SLACK_BOT_TOKEN GITHUB_OUTPUT   (GIT_BASE: tests only, default https://github.com/toniaquino)
+#      ALERT_SLACK_ID SLACK_BOT_TOKEN GITHUB_OUTPUT   (REPO_REF: test only, a branch to clone instead of the default)
+#        (GIT_BASE: tests only, default https://github.com/toniaquino)
 # Writes base_sha (the commit the model starts from) and skip=true|false (duplicate-run guard) to $GITHUB_OUTPUT.
 set -eu
 GIT_BASE="${GIT_BASE:-https://github.com/toniaquino}"
 REPO_DIR="/tmp/$REPO_NAME"
 AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_PAT" | base64 -w 0)"
-git -c http.extraheader="$AUTH_HEADER" clone --depth 1 "$GIT_BASE/$REPO_NAME.git" "$REPO_DIR"
+git -c http.extraheader="$AUTH_HEADER" clone --depth 1 ${REPO_REF:+--branch "$REPO_REF"} "$GIT_BASE/$REPO_NAME.git" "$REPO_DIR"
 git -C "$REPO_DIR" config http.https://github.com/.extraheader "$AUTH_HEADER"
 echo "base_sha=$(git -C "$REPO_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
